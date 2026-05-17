@@ -58,8 +58,10 @@ build/
 *.local
 
 # Misc
-docs/
 AppIcons/
+docs/
+!server/app/static/AppIcons/
+!server/app/static/AppIcons/**
 
 # Coverage and test artifacts
 coverage/

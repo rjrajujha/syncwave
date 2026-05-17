@@ -1,88 +1,107 @@
 # SyncWave
 
-SyncWave is a local-first live audio streaming app. Android can host system audio with MediaProjection and AudioPlaybackCapture, and listeners can join from a browser on the same Wi-Fi/hotspot. Optional internet mode uses a self-hosted FastAPI WebSocket server.
+SyncWave is a local-first synchronized audio app. A host creates a room over
+LAN, internet, or both; listeners open a browser page; the room keeps a
+continuous 48 kHz PCM timeline so people can join before the source starts.
 
-- Version: `1.1.4`
-- Android package/application ID: `io.github.opencodequark.syncwave`
-- Source: <https://github.com/OpenCodeQuark/syncwave>
+- **Version**: `1.1.5`
+- **App ID**: `git.opencodequark.syncwave`
+- **Source**: <https://github.com/OpenCodeQuark/syncwave>
+- **Default WAN server**: `wss://syncwave.rajujha.dev`
 
 ## Features
 
-- LAN browser listening through `GET /stream/join` and `WS /stream/audio`.
-- Optional WAN rooms through the FastAPI signaling/relay server.
-- Explicit LAN, Internet, or LAN + Internet broadcast choice when both are ready.
-- Active broadcast banner with Return and Stop actions.
-- Room PIN: optional, exactly 6 digits.
-- Server Connection PIN: optional, exactly 8 digits for protected host/relay actions.
-- Mobile-first Material 3 app UI and refreshed browser listener page.
+- Android LAN/WAN hosting with system audio capture on Android 10+.
+- Android/iOS microphone hosting and local Music-to-room routing.
+- Browser listeners through `/stream/join` with Web Audio synchronization.
+- Optional FastAPI WAN relay with listener-only auth support.
+- Room PINs for listener joins and Server Connection PINs for host/relay actions.
+- LAN JSON/base64 compatibility plus optional binary PCM WebSocket frames.
+- Browser QR/link sharing from Lobby and Live Room screens.
 
-## App Setup
+## Architecture
+
+```mermaid
+flowchart LR
+  App["Flutter app"] --> Room["RoomLifecycleManager"]
+  Room --> Broadcast["LiveAudioBroadcastService"]
+  Broadcast --> Lan["LocalAudioBroadcastServer"]
+  Broadcast --> Wan["InternetAudioRelayService"]
+  Lan --> LanListener["LAN browser listener"]
+  Wan --> FastAPI["FastAPI server"]
+  FastAPI --> WanListener["WAN browser listener"]
+  Cast["Cast / Music / Microphone"] --> Broadcast
+```
+
+LAN rooms are served directly from the host device. WAN rooms use the FastAPI
+server for room metadata, signaling, and PCM relay. Redis is optional status
+plumbing only; room and socket state are process-local.
+
+## Setup
+
+### Flutter app
 
 ```sh
 cd apps
 flutter pub get
 dart run build_runner build --delete-conflicting-outputs
+dart format .
 flutter analyze
 flutter test
-flutter build apk --debug
-```
-
-Release validation:
-
-```sh
-cd apps
 flutter build apk --release
 ```
 
-Android hosting needs a physical Android 10+ device. Emulators do not fully validate system-audio capture.
+Use a physical Android 10+ device for system-audio validation. Emulators do not
+represent `AudioPlaybackCapture` behavior reliably.
 
-## Server Setup
+### WAN server
 
 ```sh
 cd server
 python -m venv .venv
-.venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python -m pip install ruff
 .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-Main server routes: `GET /`, `GET /health`, `GET /status`, `POST /rooms`, `GET /stream/join`, and `WS /ws`.
+Main endpoints: `GET /`, `GET /health`, `GET /status`, `POST /rooms`,
+`GET /rooms/{room_id}`, `GET /stream/join`, and `WS /ws`.
 
-For GitHub Releases, the workflow uses `GITHUB_TOKEN` with `contents: write`. Also verify: Repo -> Settings -> Actions -> General -> Workflow permissions -> Read and write permissions.
-
-## Usage
-
-For LAN, connect the host and listener to the same Wi-Fi or Android hotspot, start a broadcast, choose LAN, approve Android capture prompts, then open the shown `/stream/join` URL on another device.
-
-For internet mode, deploy the server over HTTPS/WSS, enable Internet Streaming in app Settings, test/connect the server, then choose Internet or LAN + Internet when starting a broadcast.
-
-## PINs
-
-- Room PIN protects a room. Normal listeners only need this 6-digit PIN when the room is protected.
-- Server Connection PIN protects host/server actions such as WAN room creation and relay startup.
-- `/stream/join` never asks normal listeners for the Server Connection PIN.
-
-## Tests
+Docker:
 
 ```sh
-cd apps
-dart format --output=none --set-exit-if-changed lib test
-flutter analyze
-flutter test
-flutter build apk --debug
-
-cd ../server
-.venv/bin/python -m ruff check app tests
-.venv/bin/python -m pytest
+docker compose up --build signaling-server
+docker compose --profile redis up
 ```
 
-## Known Limitations
+For production, set a real `PIN_HASH_SECRET`, enable
+`REQUIRE_SERVER_CONNECTION_PIN` when hosts should be protected, terminate TLS
+for HTTPS/WSS, and use sticky sessions or shared state before scaling beyond
+one process.
 
-- Audio transport is still PCM16 mono JSON/base64 over WebSocket. Opus/WebRTC remains future work.
-- Android is the supported host platform; other platforms are listener/control surfaces for now.
-- In-app listener playback is not implemented; listener flows open or copy the browser listener link.
-- Android OS-level `syncwave://` intent-filter launch handling is pending.
-- Redis is optional but not yet shared room state across multiple server instances.
+## Release Builds
 
-Made with love by [R. Jha](https://rjrajujha.github.io)
+GitHub Releases are built by [`.github/workflows/flutter-release.yml`](.github/workflows/flutter-release.yml):
+
+- **Signed APK** when all four Android signing secrets are configured (see [workflow docs](.github/workflows/README.md)).
+- **Unsigned APK** (debug signing) when secrets are missing — the workflow still publishes artifacts with a clear warning.
+
+F-Droid artifacts use [`.github/workflows/fdroid-release.yml`](.github/workflows/fdroid-release.yml) with Gradle `-Psyncwave.fdroid=true` (no app-side release signing). Store metadata: `fastlane/metadata/android/en-US/`.
+
+Signing secrets must be under **Settings → Secrets and variables → Actions** (repository secrets), not Agents secrets. See [`.github/workflows/README.md`](.github/workflows/README.md).
+
+## Platform Notes
+
+- Android is the primary host platform.
+- iOS can host microphone and Music, but not system-wide audio.
+- Browser listeners are the production listener path.
+- Native in-app PCM listener playback is scaffolded but not enabled.
+- WAN transport is still PCM16/base64 JSON; LAN can negotiate binary PCM.
+- FastAPI rooms are in-memory per process.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+[MIT](LICENSE)

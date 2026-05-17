@@ -5,12 +5,13 @@ import re
 from contextlib import contextmanager
 from typing import Iterator, Optional
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import get_settings
 from app.main import create_app
 from app.models.events import EventEnvelope
-from app.services.room_service import RoomService
+from app.services.room_service import RoomError, RoomService
 from app.services.signaling_service import SignalingService
 from app.services.sync_service import SyncService
 
@@ -48,7 +49,7 @@ def send_hello(
 ) -> dict:
     payload = {
         'appName': 'SyncWave App',
-        'appVersion': '1.1.4',
+        'appVersion': '1.1.5',
         'protocolVersion': protocol_version,
         'clientPlatform': 'android',
     }
@@ -115,7 +116,7 @@ def test_websocket_connect_and_server_hello_success() -> None:
             hello_response = send_hello(websocket)
 
     assert hello_response['type'] == 'server.ready'
-    assert hello_response['payload']['serverVersion'] == '1.1.4'
+    assert hello_response['payload']['serverVersion'] == '1.1.5'
 
 
 def test_server_hello_requires_auth_when_enabled() -> None:
@@ -131,13 +132,28 @@ def test_server_hello_requires_auth_when_enabled() -> None:
     assert response['type'] == 'server.auth_required'
 
 
-def test_listener_handshake_does_not_require_server_pin_when_auth_enabled() -> None:
+def test_host_handshake_requires_server_pin_when_auth_enabled() -> None:
     env = {
         'REQUIRE_SERVER_CONNECTION_PIN': 'true',
         'SERVER_CONNECTION_PIN': '12345678',
     }
     with make_client(env) as client:
-        with client.websocket_connect('/ws?peerId=browser_listener_auth') as websocket:
+        with client.websocket_connect('/ws?peerId=host_auth') as websocket:
+            websocket.receive_json()
+            response = send_hello(websocket)
+
+    assert response['type'] == 'server.auth_required'
+    assert response['payload']['code'] == 'server_connection_pin_required'
+
+
+def test_listener_handshake_succeeds_without_server_pin() -> None:
+    env = {
+        'REQUIRE_SERVER_CONNECTION_PIN': 'true',
+        'SERVER_CONNECTION_PIN': '12345678',
+        'ALLOW_LISTENER_ONLY_WITHOUT_SERVER_PIN': 'false',
+    }
+    with make_client(env) as client:
+        with client.websocket_connect('/ws?peerId=browser_listener_public') as websocket:
             websocket.receive_json()
             response = send_hello(
                 websocket,
@@ -148,6 +164,7 @@ def test_listener_handshake_does_not_require_server_pin_when_auth_enabled() -> N
     assert response['type'] == 'server.ready'
     assert response['payload']['listenerOnly'] is True
     assert response['payload']['authenticated'] is False
+    assert response['payload']['authenticationRequired'] is False
 
 
 def test_server_hello_auth_failed_with_wrong_pin() -> None:
@@ -327,7 +344,7 @@ def test_late_stream_listener_receives_cached_audio_metadata() -> None:
             type='stream.host_start',
             roomId=room_id,
             peerId='host_meta',
-            payload={'streamStartedAt': 111, 'targetBufferMs': 420},
+            payload={'streamStartedAt': 111, 'targetBufferMs': 680},
         )
     )
     assert ready.type == 'stream.ready'
@@ -344,7 +361,19 @@ def test_late_stream_listener_receives_cached_audio_metadata() -> None:
                 'durationMs': 40,
                 'format': 'pcm16',
                 'payload': 'AAAA',
+                'hostTimestamp': 1000,
+                'playAt': 1680,
             },
+        )
+    )
+
+    signaling.handle(
+        EventEnvelope(
+            type='room.join',
+            requestId='join-meta-late',
+            roomId=room_id,
+            peerId='late_listener',
+            payload={'deviceName': 'Late Listener', 'platform': 'web'},
         )
     )
 
@@ -360,10 +389,25 @@ def test_late_stream_listener_receives_cached_audio_metadata() -> None:
 
     assert broadcasts == []
     assert response.type == 'stream.listener_joined'
-    assert response.payload['targetBufferMs'] == 420
+    assert response.payload['targetBufferMs'] == 680
     assert response.payload['sampleRate'] == 48000
     assert response.payload['channelCount'] == 1
     assert response.payload['durationMs'] == 40
+
+
+def test_stream_listener_join_requires_active_room() -> None:
+    signaling = make_signaling_service()
+
+    with pytest.raises(RoomError, match='Room is not active'):
+        signaling.handle(
+            EventEnvelope(
+                type='stream.listener_join',
+                requestId='listener-meta-missing',
+                roomId='WAN-NONE1',
+                peerId='late_listener',
+                payload={'roomId': 'WAN-NONE1'},
+            )
+        )
 
 
 def test_web_listener_platform_can_join_wan_room() -> None:
@@ -414,6 +458,7 @@ def test_protected_server_allows_browser_listener_join_with_room_pin_only() -> N
                 assert (
                     send_hello(
                         listener,
+                        pin='12345678',
                         client_role='listener',
                         listener_only=True,
                     )['type']
@@ -524,6 +569,122 @@ def test_stream_ping_returns_server_time() -> None:
     assert response['payload']['clientTime'] == 12345
 
 
+def test_protected_room_join_without_pin_rejected() -> None:
+    with make_client() as client:
+        with client.websocket_connect('/ws?peerId=host_pin_gate') as host:
+            host.receive_json()
+            assert send_hello(host)['type'] == 'server.ready'
+            room_id = create_room(host, pin='112233')
+
+            with client.websocket_connect('/ws?peerId=listener_pin_gate') as listener:
+                listener.receive_json()
+                assert send_hello(listener)['type'] == 'server.ready'
+                listener.send_json(
+                    {
+                        'type': 'room.join',
+                        'requestId': 'join-pin-gate-1',
+                        'roomId': room_id,
+                        'payload': {
+                            'deviceName': 'Listener',
+                            'platform': 'web',
+                        },
+                    }
+                )
+                response = listener.receive_json()
+
+    assert response['type'] == 'room.join_failed'
+    assert 'PIN' in response['payload']['message']
+
+
+def test_stream_listener_join_without_pin_on_protected_room_rejected() -> None:
+    with make_client() as client:
+        with client.websocket_connect('/ws?peerId=host_lj_pin') as host:
+            host.receive_json()
+            assert send_hello(host)['type'] == 'server.ready'
+            room_id = create_room(host, pin='445566')
+
+            with client.websocket_connect('/ws?peerId=listener_lj_pin') as listener:
+                listener.receive_json()
+                assert send_hello(listener)['type'] == 'server.ready'
+                listener.send_json(
+                    {
+                        'type': 'room.join',
+                        'requestId': 'join-lj-pin-1',
+                        'roomId': room_id,
+                        'payload': {
+                            'deviceName': 'Listener',
+                            'platform': 'web',
+                            'pin': '445566',
+                        },
+                    }
+                )
+                assert listener.receive_json()['type'] == 'room.joined'
+                host.receive_json()  # participant.joined
+                host.receive_json()  # stream.listener_count
+
+                listener.send_json(
+                    {
+                        'type': 'stream.listener_join',
+                        'requestId': 'listener-join-no-pin',
+                        'roomId': room_id,
+                        'payload': {'roomId': room_id},
+                    }
+                )
+                response = listener.receive_json()
+
+    assert response['type'] == 'stream.failed'
+    assert 'PIN' in response['payload']['message']
+
+
+def test_room_create_pin_protected_without_pin_rejected() -> None:
+    with make_client() as client:
+        with client.websocket_connect('/ws?peerId=host_create_pin') as host:
+            host.receive_json()
+            assert send_hello(host)['type'] == 'server.ready'
+            host.send_json(
+                {
+                    'type': 'room.create',
+                    'requestId': 'create-pin-protected',
+                    'payload': {
+                        'roomName': 'Protected',
+                        'deviceName': 'Host',
+                        'platform': 'android',
+                        'pinProtected': True,
+                    },
+                }
+            )
+            response = host.receive_json()
+
+    assert response['type'] == 'room.create_failed'
+    assert 'PIN' in response['payload']['message']
+
+
+def test_stream_listener_join_without_room_join_rejected() -> None:
+    with make_client() as client:
+        with client.websocket_connect('/ws?peerId=host_skip_join') as host:
+            host.receive_json()
+            assert send_hello(host)['type'] == 'server.ready'
+            room_id = create_room(host)
+
+            with client.websocket_connect('/ws?peerId=listener_skip_join') as listener:
+                listener.receive_json()
+                assert send_hello(listener, client_role='listener', listener_only=True)[
+                    'type'
+                ] == 'server.ready'
+                listener.send_json(
+                    {
+                        'type': 'stream.listener_join',
+                        'requestId': 'listener-skip-join-1',
+                        'roomId': room_id,
+                        'payload': {'roomId': room_id},
+                    }
+                )
+                response = listener.receive_json()
+
+    assert response['type'] == 'stream.failed'
+    assert 'room.join' in response['payload']['message']
+
+
 def test_stream_audio_chunk_routes_to_room_listeners() -> None:
     with make_client() as client:
         with client.websocket_connect('/ws?peerId=host_stream') as host:
@@ -549,6 +710,8 @@ def test_stream_audio_chunk_routes_to_room_listeners() -> None:
                 host.receive_json()  # participant.joined
                 host.receive_json()  # stream.listener_count
 
+                host_timestamp = int(__import__('time').time() * 1000) - 10_000
+                play_at = host_timestamp + 680
                 host.send_json(
                     {
                         'type': 'stream.audio_chunk',
@@ -561,6 +724,8 @@ def test_stream_audio_chunk_routes_to_room_listeners() -> None:
                             'durationMs': 40,
                             'format': 'pcm16',
                             'payload': 'AAAB',
+                            'hostTimestamp': host_timestamp,
+                            'playAt': play_at,
                         },
                     }
                 )
@@ -570,6 +735,7 @@ def test_stream_audio_chunk_routes_to_room_listeners() -> None:
     assert accepted['type'] == 'stream.audio_accepted'
     assert routed['type'] == 'stream.audio_chunk'
     assert routed['payload']['sequence'] == 1
+    assert routed['payload']['playAt'] == routed['payload']['serverTime'] + 680
 
 
 def test_listener_count_updates_on_join_and_leave() -> None:
@@ -607,6 +773,111 @@ def test_listener_count_updates_on_join_and_leave() -> None:
                 leave_count = host.receive_json()
 
     assert join_count['type'] == 'stream.listener_count'
-    assert join_count['payload']['count'] >= 2
+    assert join_count['payload']['count'] == 1
     assert leave_event['type'] == 'participant.left'
     assert leave_count['type'] == 'stream.listener_count'
+    assert leave_count['payload']['count'] == 0
+
+
+def test_stream_host_stop_closes_rest_created_room() -> None:
+    with make_client() as client:
+        created = client.post('/rooms', json={'roomName': 'WAN', 'roomId': 'WAN-HSTOP'})
+        assert created.status_code == 201
+
+        with client.websocket_connect('/ws?peerId=relay_host_stop') as host:
+            host.receive_json()
+            assert send_hello(host)['type'] == 'server.ready'
+            host.send_json(
+                {
+                    'type': 'stream.host_start',
+                    'requestId': 'host-start-1',
+                    'roomId': 'WAN-HSTOP',
+                    'payload': {'roomId': 'WAN-HSTOP', 'targetBufferMs': 680},
+                }
+            )
+            assert host.receive_json()['type'] == 'stream.ready'
+
+            with client.websocket_connect('/ws?peerId=listener_host_stop') as listener:
+                listener.receive_json()
+                assert send_hello(listener)['type'] == 'server.ready'
+                listener.send_json(
+                    {
+                        'type': 'room.join',
+                        'requestId': 'join-host-stop-1',
+                        'roomId': 'WAN-HSTOP',
+                        'payload': {'deviceName': 'Listener', 'platform': 'web'},
+                    }
+                )
+                assert listener.receive_json()['type'] == 'room.joined'
+                host.receive_json()  # participant.joined
+                host.receive_json()  # stream.listener_count
+
+                host.send_json(
+                    {
+                        'type': 'stream.host_stop',
+                        'requestId': 'host-stop-1',
+                        'roomId': 'WAN-HSTOP',
+                        'payload': {'roomId': 'WAN-HSTOP'},
+                    }
+                )
+                assert host.receive_json()['type'] == 'stream.host_stopped'
+                event_types = {
+                    listener.receive_json()['type'],
+                    listener.receive_json()['type'],
+                    listener.receive_json()['type'],
+                }
+
+        lookup = client.get('/rooms/WAN-HSTOP')
+
+    assert 'stream.host_stopped' in event_types
+    assert 'stream.listener_count' in event_types
+    assert 'room.closed' in event_types
+    assert lookup.status_code == 404
+
+
+def test_stream_host_relay_disconnect_closes_rest_created_room() -> None:
+    with make_client() as client:
+        created = client.post('/rooms', json={'roomName': 'WAN', 'roomId': 'WAN-HDROP'})
+        assert created.status_code == 201
+
+        with client.websocket_connect('/ws?peerId=relay_host_drop') as host:
+            host.receive_json()
+            assert send_hello(host)['type'] == 'server.ready'
+            host.send_json(
+                {
+                    'type': 'stream.host_start',
+                    'requestId': 'host-start-drop-1',
+                    'roomId': 'WAN-HDROP',
+                    'payload': {'roomId': 'WAN-HDROP', 'targetBufferMs': 680},
+                }
+            )
+            assert host.receive_json()['type'] == 'stream.ready'
+
+            with client.websocket_connect('/ws?peerId=listener_host_drop') as listener:
+                listener.receive_json()
+                assert send_hello(listener)['type'] == 'server.ready'
+                listener.send_json(
+                    {
+                        'type': 'room.join',
+                        'requestId': 'join-host-drop-1',
+                        'roomId': 'WAN-HDROP',
+                        'payload': {'deviceName': 'Listener', 'platform': 'web'},
+                    }
+                )
+                assert listener.receive_json()['type'] == 'room.joined'
+                host.receive_json()  # participant.joined
+                host.receive_json()  # stream.listener_count
+
+                host.close()
+                event_types = {
+                    listener.receive_json()['type'],
+                    listener.receive_json()['type'],
+                    listener.receive_json()['type'],
+                }
+
+        lookup = client.get('/rooms/WAN-HDROP')
+
+    assert 'participant.left' in event_types
+    assert 'stream.listener_count' in event_types
+    assert 'room.closed' in event_types
+    assert lookup.status_code == 404

@@ -19,8 +19,14 @@ fun keystoreProperty(name: String): String {
 }
 
 val releaseStoreFilePath = keystoreProperty("storeFile")
+val isFdroidBuild =
+    providers
+        .gradleProperty("syncwave.fdroid")
+        .map { it.equals("true", ignoreCase = true) }
+        .getOrElse(false)
 val hasReleaseSigningConfig =
-    keystorePropertiesFile.exists() &&
+    !isFdroidBuild &&
+        keystorePropertiesFile.exists() &&
         releaseStoreFilePath.isNotEmpty() &&
         keystoreProperty("storePassword").isNotEmpty() &&
         keystoreProperty("keyAlias").isNotEmpty() &&

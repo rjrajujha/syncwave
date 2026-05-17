@@ -18,11 +18,15 @@ class ConnectionManager:
         await websocket.accept()
         self._connections[peer_id] = websocket
 
-    async def send_to_peer(self, *, peer_id: str, event: EventEnvelope) -> None:
+    async def send_to_peer(self, *, peer_id: str, event: EventEnvelope) -> bool:
         socket = self._connections.get(peer_id)
         if socket is None:
-            return
-        await socket.send_json(event.to_wire())
+            return False
+        try:
+            await socket.send_json(event.to_wire())
+        except Exception:  # noqa: BLE001
+            return False
+        return True
 
     async def broadcast_to_room(
         self,
@@ -30,12 +34,16 @@ class ConnectionManager:
         room_id: str,
         event: EventEnvelope,
         exclude_peer_ids: Optional[Set[str]] = None,
-    ) -> None:
+    ) -> set[str]:
         exclusions = exclude_peer_ids or set()
-        for peer_id in self._room_peers.get(room_id, set()):
+        failed_peer_ids: set[str] = set()
+        for peer_id in list(self._room_peers.get(room_id, set())):
             if peer_id in exclusions:
                 continue
-            await self.send_to_peer(peer_id=peer_id, event=event)
+            sent = await self.send_to_peer(peer_id=peer_id, event=event)
+            if not sent:
+                failed_peer_ids.add(peer_id)
+        return failed_peer_ids
 
     def register_peer_room(self, *, peer_id: str, room_id: str) -> None:
         self._peer_rooms[peer_id] = room_id
@@ -53,6 +61,22 @@ class ConnectionManager:
                 self._room_peers.pop(room_id, None)
 
         return room_id
+
+    async def close_peer(
+        self,
+        *,
+        peer_id: str,
+        code: int = 4403,
+        reason: str = 'authentication_failed',
+    ) -> None:
+        socket = self._connections.pop(peer_id, None)
+        self.unregister_peer_room(peer_id=peer_id)
+        if socket is None:
+            return
+        try:
+            await socket.close(code=code, reason=reason)
+        except Exception:  # noqa: BLE001
+            return
 
     def disconnect(self, *, peer_id: str) -> Optional[str]:
         self._connections.pop(peer_id, None)

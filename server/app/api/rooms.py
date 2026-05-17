@@ -4,8 +4,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 
 from ..core.config import Settings, get_settings
-from ..core.security import is_valid_server_connection_pin
-from ..services.room_service import RoomService
+from ..core.security import is_valid_room_pin, is_valid_server_connection_pin
+from ..services.room_service import RoomError, RoomService
 
 router = APIRouter(prefix='/rooms', tags=['rooms'])
 
@@ -15,6 +15,7 @@ class CreateRoomRequest(BaseModel):
     hostPeerId: str = 'api_host'
     hostDeviceName: str = 'API Host'
     hostPlatform: str = 'android'
+    pinProtected: bool = False
     pin: Optional[str] = None
     roomId: Optional[str] = None
 
@@ -47,15 +48,29 @@ def create_room(
 ) -> CreateRoomResponse:
     _require_server_pin_for_host_action(request=request, settings=settings)
     room_service: RoomService = request.app.state.room_service
+    normalized_pin = RoomService.normalize_pin(payload.pin)
+    if payload.pinProtected and normalized_pin is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Room PIN is required when pinProtected is true.',
+        )
+    if normalized_pin is not None and not is_valid_room_pin(normalized_pin):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Room PIN must be exactly 6 digits.',
+        )
     try:
         room = room_service.create_room(
             room_name=payload.roomName,
             host_peer_id=payload.hostPeerId,
             host_device_name=payload.hostDeviceName,
             host_platform=payload.hostPlatform,
-            pin=payload.pin,
+            pin=normalized_pin,
             room_id=payload.roomId,
+            pin_protected=payload.pinProtected or bool(normalized_pin),
         )
+    except RoomError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 

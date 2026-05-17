@@ -109,10 +109,20 @@ class WebSocketEventHandler:
 
             response, broadcasts = self._signaling.handle(event)
 
-            if event.type in {'room.create', 'room.join'} and response.room_id:
+            success_by_event = {
+                'room.create': 'room.created',
+                'room.join': 'room.joined',
+                'stream.host_start': 'stream.ready',
+            }
+            expected_success = success_by_event.get(event.type)
+            if (
+                expected_success is not None
+                and response.type == expected_success
+                and response.room_id
+            ):
                 self._manager.register_peer_room(peer_id=peer_id, room_id=response.room_id)
 
-            if event.type == 'room.leave':
+            if event.type in {'room.leave', 'stream.host_stop'}:
                 self._manager.unregister_peer_room(peer_id=peer_id)
 
             await self._manager.send_to_peer(peer_id=peer_id, event=response)
@@ -122,10 +132,14 @@ class WebSocketEventHandler:
                 return
 
             for broadcast in broadcasts:
-                await self._manager.broadcast_to_room(
+                failed_peer_ids = await self._manager.broadcast_to_room(
                     room_id=room_id,
                     event=broadcast,
                     exclude_peer_ids={peer_id},
+                )
+                await self._cleanup_failed_peers(
+                    room_id=room_id,
+                    failed_peer_ids=failed_peer_ids,
                 )
 
         except ValidationError as exc:
@@ -177,11 +191,12 @@ class WebSocketEventHandler:
             return
 
         listener_only = self._is_listener_handshake(payload)
-        privileged = not self._settings.require_server_connection_pin
+        pin_authenticated = not self._settings.require_server_connection_pin
 
         if self._settings.require_server_connection_pin:
             server_pin = str(payload.get('serverConnectionPin') or '').strip()
             if not server_pin:
+                # Listeners never need the Server Connection PIN; only hosts/relays do.
                 if listener_only:
                     self._handshake_accepted[peer_id] = True
                     self._privileged_peers.discard(peer_id)
@@ -193,17 +208,12 @@ class WebSocketEventHandler:
                     )
                     return
 
-                await self._manager.send_to_peer(
+                await self._reject_server_handshake(
                     peer_id=peer_id,
-                    event=EventEnvelope(
-                        type='server.auth_required',
-                        requestId=event.request_id,
-                        peerId=peer_id,
-                        payload={
-                            'code': 'server_connection_pin_required',
-                            'message': 'Server Connection PIN is required.',
-                        },
-                    ),
+                    event=event,
+                    response_type='server.auth_required',
+                    code='server_connection_pin_required',
+                    message='Server Connection PIN is required.',
                 )
                 return
 
@@ -213,31 +223,27 @@ class WebSocketEventHandler:
                 or not is_valid_server_connection_pin(expected_pin)
                 or server_pin != expected_pin
             ):
-                await self._manager.send_to_peer(
+                await self._reject_server_handshake(
                     peer_id=peer_id,
-                    event=EventEnvelope(
-                        type='server.auth_failed',
-                        requestId=event.request_id,
-                        peerId=peer_id,
-                        payload={
-                            'code': 'server_connection_pin_invalid',
-                            'message': 'Server Connection PIN validation failed.',
-                        },
-                    ),
+                    event=event,
+                    response_type='server.auth_failed',
+                    code='server_connection_pin_invalid',
+                    message='Server Connection PIN validation failed.',
                 )
                 return
-            privileged = True
+            pin_authenticated = True
 
         self._handshake_accepted[peer_id] = True
-        if privileged:
+        # Authenticated listeners may join rooms but must never relay host audio.
+        if pin_authenticated and not listener_only:
             self._privileged_peers.add(peer_id)
         else:
             self._privileged_peers.discard(peer_id)
         await self._send_server_ready(
             peer_id=peer_id,
             request_id=event.request_id,
-            authenticated=privileged,
-            listener_only=listener_only and not privileged,
+            authenticated=pin_authenticated,
+            listener_only=listener_only,
         )
 
     async def _send_server_ready(
@@ -259,7 +265,9 @@ class WebSocketEventHandler:
                     'server': self._settings.app_name,
                     'serverVersion': self._settings.app_version,
                     'protocolVersion': self._settings.protocol_version,
-                    'authenticationRequired': self._settings.require_server_connection_pin,
+                    'authenticationRequired': (
+                        self._settings.require_server_connection_pin and not listener_only
+                    ),
                     'authenticated': authenticated,
                     'listenerOnly': listener_only,
                     'capabilities': {
@@ -269,6 +277,35 @@ class WebSocketEventHandler:
                     },
                 },
             ),
+        )
+
+    async def _reject_server_handshake(
+        self,
+        *,
+        peer_id: str,
+        event: EventEnvelope,
+        response_type: str,
+        code: str,
+        message: str,
+    ) -> None:
+        self._handshake_accepted[peer_id] = False
+        self._privileged_peers.discard(peer_id)
+        await self._manager.send_to_peer(
+            peer_id=peer_id,
+            event=EventEnvelope(
+                type=response_type,
+                requestId=event.request_id,
+                peerId=peer_id,
+                payload={
+                    'code': code,
+                    'message': message,
+                },
+            ),
+        )
+        await self._manager.close_peer(
+            peer_id=peer_id,
+            code=4403,
+            reason=code,
         )
 
     def _is_listener_handshake(self, payload: dict[str, Any]) -> bool:
@@ -304,3 +341,20 @@ class WebSocketEventHandler:
             'stream.ping': 'stream.failed',
         }
         return mapping.get(request_type or '', 'error')
+
+    async def _cleanup_failed_peers(self, *, room_id: str, failed_peer_ids: set[str]) -> None:
+        for failed_peer_id in failed_peer_ids:
+            stale_room_id = self._manager.disconnect(peer_id=failed_peer_id)
+            self._handshake_accepted.pop(failed_peer_id, None)
+            self._privileged_peers.discard(failed_peer_id)
+            if stale_room_id == room_id:
+                cleanup_events = self._signaling.handle_disconnect(
+                    room_id=room_id,
+                    peer_id=failed_peer_id,
+                )
+                for cleanup_event in cleanup_events:
+                    await self._manager.broadcast_to_room(
+                        room_id=room_id,
+                        event=cleanup_event,
+                        exclude_peer_ids={failed_peer_id},
+                    )

@@ -12,7 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 TEST_ENV_DEFAULTS = {
-    'APP_VERSION': '1.1.4',
+    'APP_VERSION': '1.1.5',
     'REQUIRE_SERVER_CONNECTION_PIN': 'false',
     'SERVER_CONNECTION_PIN': '',
 }

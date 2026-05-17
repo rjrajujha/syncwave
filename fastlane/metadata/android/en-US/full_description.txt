@@ -1,0 +1,20 @@
+SyncWave creates synchronized audio rooms for small trusted groups.
+
+Host from Android over a local Wi-Fi or hotspot connection, or use an optional self-hosted FastAPI relay for internet rooms. Listeners join from a browser with Web Audio, so they do not need to install the app.
+
+Core features:
+
+* LAN rooms with local HTTP and WebSocket listener pages
+* Optional WAN rooms through a configurable self-hosted signaling server
+* Android system-audio capture on Android 10+
+* Microphone hosting on Android and iOS
+* Local Music routing through decoded PCM
+* Room PINs for protected listener joins
+* Server Connection PINs for protected host/relay actions
+* Browser listener synchronization using server-stamped play times
+
+SyncWave works without Google Play Services, Firebase, ads, analytics, or proprietary tracking SDKs. The default internet relay is configurable, and LAN rooms work without any cloud service.
+
+Publisher: OpenCodeQuark
+https://github.com/OpenCodeQuark
+Source: https://github.com/OpenCodeQuark/syncwave

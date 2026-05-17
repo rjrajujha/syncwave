@@ -1,0 +1,1 @@
+SyncWave 1.1.5 refines the room and Cast architecture, improves browser listener synchronization, hardens WAN relay cleanup, updates release workflows, and adds F-Droid-friendly unsigned release artifact generation.

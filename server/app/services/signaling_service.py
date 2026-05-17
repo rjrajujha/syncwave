@@ -7,12 +7,15 @@ from ..models.peer import Peer
 from .room_service import RoomError, RoomService
 from .sync_service import SyncService
 
+SYNC_TARGET_BUFFER_MS = 680
+
 
 class SignalingService:
     def __init__(self, room_service: RoomService, sync_service: SyncService):
         self._room_service = room_service
         self._sync_service = sync_service
         self._stream_meta_by_room: dict[str, dict[str, Any]] = {}
+        self._stream_host_peer_by_room: dict[str, str] = {}
 
     def handle(self, event: EventEnvelope) -> tuple[EventEnvelope, list[EventEnvelope]]:
         if event.type == 'room.create':
@@ -56,17 +59,24 @@ class SignalingService:
 
         host_device_name = str(payload.get('deviceName') or 'Unknown Host').strip()
         host_platform = str(payload.get('platform') or 'unknown').strip().lower()
-        pin = payload.get('pin')
+        normalized_pin = RoomService.normalize_pin(
+            payload.get('pin') if isinstance(payload.get('pin'), str) else None
+        )
+        raw_pin_protected = payload.get('pinProtected')
+        pin_protected = (
+            bool(raw_pin_protected) if raw_pin_protected is not None else None
+        )
 
         room = self._room_service.create_room(
             room_name=room_name,
             host_peer_id=host_peer_id,
             host_device_name=host_device_name,
             host_platform=host_platform,
-            pin=pin if isinstance(pin, str) and pin else None,
+            pin=normalized_pin,
             room_id=payload.get('roomId')
             if isinstance(payload.get('roomId'), str)
             else None,
+            pin_protected=pin_protected,
         )
 
         response = EventEnvelope(
@@ -100,7 +110,9 @@ class SignalingService:
         room = self._room_service.join_room(
             room_id=event.room_id,
             peer=listener,
-            pin=payload.get('pin') if isinstance(payload.get('pin'), str) else None,
+            pin=RoomService.normalize_pin(
+                payload.get('pin') if isinstance(payload.get('pin'), str) else None
+            ),
         )
 
         joined_response = EventEnvelope(
@@ -125,7 +137,7 @@ class SignalingService:
                 EventEnvelope(
                     type='stream.listener_count',
                     roomId=room.room_id,
-                    payload={'count': len(room.participants)},
+                    payload={'count': self._listener_count(room)},
                 ),
             ]
 
@@ -161,12 +173,13 @@ class SignalingService:
             EventEnvelope(
                 type='stream.listener_count',
                 roomId=event.room_id,
-                payload={'count': len(room.participants) if room is not None else 0},
+                payload={'count': self._listener_count(room) if room is not None else 0},
             ),
         ]
 
         if room is not None and room.status == 'closed':
             self._stream_meta_by_room.pop(event.room_id, None)
+            self._stream_host_peer_by_room.pop(event.room_id, None)
             broadcasts.append(
                 EventEnvelope(
                     type='room.closed',
@@ -204,10 +217,12 @@ class SignalingService:
         meta_payload = {
             'roomId': event.room_id,
             'streamStartedAt': event.payload.get('streamStartedAt'),
-            'targetBufferMs': event.payload.get('targetBufferMs', 420),
+            'targetBufferMs': event.payload.get('targetBufferMs', SYNC_TARGET_BUFFER_MS),
             'serverTime': self._sync_service.server_timestamp_ms(),
         }
         self._stream_meta_by_room[event.room_id] = meta_payload
+        if event.peer_id is not None:
+            self._stream_host_peer_by_room[event.room_id] = event.peer_id
 
         return (
             EventEnvelope(
@@ -238,7 +253,11 @@ class SignalingService:
         if event.room_id is None:
             raise RoomError('roomId is required for stream.host_stop')
 
+        room = self._room_service.get_room(event.room_id)
+        if room is not None and room.status == 'active':
+            self._room_service.close_room(room_id=event.room_id)
         self._stream_meta_by_room.pop(event.room_id, None)
+        self._stream_host_peer_by_room.pop(event.room_id, None)
 
         return (
             EventEnvelope(
@@ -254,6 +273,16 @@ class SignalingService:
                     roomId=event.room_id,
                     peerId=event.peer_id,
                     payload={'roomId': event.room_id},
+                ),
+                EventEnvelope(
+                    type='stream.listener_count',
+                    roomId=event.room_id,
+                    payload={'count': 0},
+                ),
+                EventEnvelope(
+                    type='room.closed',
+                    roomId=event.room_id,
+                    payload={'reason': 'host_stopped'},
                 )
             ],
         )
@@ -263,6 +292,23 @@ class SignalingService:
     ) -> tuple[EventEnvelope, list[EventEnvelope]]:
         if event.room_id is None:
             raise RoomError('roomId is required for stream.listener_join')
+        if event.peer_id is None:
+            raise RoomError('peerId is required for stream.listener_join')
+
+        room = self._room_service.get_room(event.room_id)
+        if room is None or room.status != 'active':
+            raise RoomError('Room is not active for stream.listener_join')
+
+        if not any(peer.peer_id == event.peer_id for peer in room.participants):
+            raise RoomError('room.join is required before stream.listener_join')
+
+        payload = event.payload
+        self._room_service.validate_room_pin(
+            room_id=event.room_id,
+            pin=RoomService.normalize_pin(
+                payload.get('pin') if isinstance(payload.get('pin'), str) else None
+            ),
+        )
 
         meta_payload = {
             'roomId': event.room_id,
@@ -293,9 +339,18 @@ class SignalingService:
             raise RoomError('Room is not active for stream.audio_chunk')
 
         chunk_payload = dict(event.payload)
-        chunk_payload['serverTime'] = self._sync_service.server_timestamp_ms()
+        server_time = self._sync_service.server_timestamp_ms()
+        chunk_payload['serverTime'] = server_time
         if 'roomId' not in chunk_payload:
             chunk_payload['roomId'] = event.room_id
+
+        mapped_play_at = self._sync_service.map_play_at_to_server_time(
+            play_at_ms=chunk_payload.get('playAt'),
+            host_timestamp_ms=chunk_payload.get('hostTimestamp'),
+            server_time_ms=server_time,
+        )
+        if mapped_play_at is not None:
+            chunk_payload['playAt'] = mapped_play_at
         self._stream_meta_by_room[event.room_id] = {
             **self._stream_meta_by_room.get(event.room_id, {}),
             'roomId': event.room_id,
@@ -305,7 +360,7 @@ class SignalingService:
             'durationMs': chunk_payload.get('durationMs'),
             'targetBufferMs': self._stream_meta_by_room.get(event.room_id, {}).get(
                 'targetBufferMs',
-                420,
+                SYNC_TARGET_BUFFER_MS,
             ),
             'streamStartedAt': chunk_payload.get(
                 'streamStartedAt',
@@ -353,7 +408,16 @@ class SignalingService:
         )
 
     def handle_disconnect(self, *, room_id: str, peer_id: str) -> list[EventEnvelope]:
-        room = self._room_service.leave_room(room_id=room_id, peer_id=peer_id)
+        is_stream_host = self._stream_host_peer_by_room.get(room_id) == peer_id
+        if is_stream_host:
+            room = self._room_service.get_room(room_id)
+            if room is not None and room.status == 'active':
+                room = self._room_service.close_room(room_id=room_id)
+            self._stream_meta_by_room.pop(room_id, None)
+            self._stream_host_peer_by_room.pop(room_id, None)
+        else:
+            room = self._room_service.leave_room(room_id=room_id, peer_id=peer_id)
+
         events = [
             EventEnvelope(
                 type='participant.left',
@@ -364,16 +428,21 @@ class SignalingService:
             EventEnvelope(
                 type='stream.listener_count',
                 roomId=room_id,
-                payload={'count': len(room.participants) if room is not None else 0},
+                payload={'count': self._listener_count(room) if room is not None else 0},
             ),
         ]
         if room is not None and room.status == 'closed':
             self._stream_meta_by_room.pop(room_id, None)
+            self._stream_host_peer_by_room.pop(room_id, None)
             events.append(
                 EventEnvelope(
                     type='room.closed',
                     roomId=room_id,
-                    payload={'reason': 'host_left_or_empty_room'},
+                    payload={
+                        'reason': 'host_relay_disconnected'
+                        if is_stream_host
+                        else 'host_left_or_empty_room'
+                    },
                 )
             )
         return events
@@ -382,3 +451,6 @@ class SignalingService:
         payload = room.model_dump(by_alias=True, mode='json')
         payload.pop('pinHash', None)
         return payload
+
+    def _listener_count(self, room) -> int:
+        return sum(1 for peer in room.participants if peer.role == 'listener')

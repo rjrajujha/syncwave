@@ -27,20 +27,119 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          cache: true
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('apps/android/**/*.gradle*', 'apps/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
 
       - name: Install dependencies
         working-directory: apps
         run: flutter pub get
 
+      - name: Generate code
+        working-directory: apps
+        run: dart run build_runner build --delete-conflicting-outputs
+
+      - name: Check formatting
+        working-directory: apps
+        run: dart format --output=none --set-exit-if-changed .
+
+      - name: Analyze
+        working-directory: apps
+        run: flutter analyze
+
+      - name: Test
+        working-directory: apps
+        run: flutter test
+
+      - name: Detect Android signing secrets
+        id: signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -z "${ANDROID_KEYSTORE_BASE64:-}" ] && missing+=("ANDROID_KEYSTORE_BASE64")
+          [ -z "${ANDROID_KEYSTORE_PASSWORD:-}" ] && missing+=("ANDROID_KEYSTORE_PASSWORD")
+          [ -z "${ANDROID_KEY_ALIAS:-}" ] && missing+=("ANDROID_KEY_ALIAS")
+          [ -z "${ANDROID_KEY_PASSWORD:-}" ] && missing+=("ANDROID_KEY_PASSWORD")
+
+          if [ "${#missing[@]}" -eq 0 ]; then
+            echo "mode=signed" >> "$GITHUB_OUTPUT"
+            echo "extra_apk=app-release-signed.apk" >> "$GITHUB_OUTPUT"
+            echo "All four Actions repository secrets are set — building a signed release APK."
+          elif [ "${#missing[@]}" -eq 4 ]; then
+            echo "mode=unsigned" >> "$GITHUB_OUTPUT"
+            echo "extra_apk=app-release-unsigned.apk" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Unsigned release APK::No Android signing secrets visible to GitHub Actions."
+            echo "::warning::Add secrets under Settings → Secrets and variables → Actions → Repository secrets (not Agents secrets)."
+            echo "::warning::Required names: ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD"
+          else
+            echo "::error title=Incomplete Android signing secrets::Configure all four Actions repository secrets, or none. Missing: ${missing[*]}"
+            echo "::error::Secrets must live under Settings → Secrets and variables → Actions. Agents secrets are not available to workflows."
+            exit 1
+          fi
+
+      - name: Configure release signing
+        if: steps.signing.outputs.mode == 'signed'
+        working-directory: apps
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | tr -d '\n\r ' | base64 --decode > android/release-keystore.jks
+          test -s android/release-keystore.jks
+          keytool -list \
+            -keystore android/release-keystore.jks \
+            -storepass "$ANDROID_KEYSTORE_PASSWORD" \
+            -alias "$ANDROID_KEY_ALIAS" >/dev/null
+          {
+            echo "storeFile=release-keystore.jks"
+            printf 'storePassword=%s\n' "$ANDROID_KEYSTORE_PASSWORD"
+            printf 'keyAlias=%s\n' "$ANDROID_KEY_ALIAS"
+            printf 'keyPassword=%s\n' "$ANDROID_KEY_PASSWORD"
+          } > android/key.properties
+          echo "Release keystore decoded and verified."
+
       - name: Build Release APK
         working-directory: apps
         run: flutter build apk --release
+
+      - name: Prepare release artifacts
+        run: |
+          set -euo pipefail
+          SRC="apps/build/app/outputs/flutter-apk/app-release.apk"
+          test -f "$SRC"
+          mkdir -p release-artifacts
+          cp "$SRC" release-artifacts/app-release.apk
+          cp "$SRC" "release-artifacts/${{ steps.signing.outputs.extra_apk }}"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          body: |
+            ## Android APK
+
+            - `app-release.apk` — primary download
+            - `${{ steps.signing.outputs.extra_apk }}` — **${{ steps.signing.outputs.mode }}** build
+
+            ${{ steps.signing.outputs.mode == 'signed' && 'Signed with the release keystore from GitHub Actions repository secrets.' || '**Unsigned** (debug signing). Add all four secrets under **Settings → Secrets and variables → Actions** (not Agents secrets) for a signed build.' }}
           files: |
-            apps/build/app/outputs/flutter-apk/app-release.apk
+            release-artifacts/app-release.apk
+            release-artifacts/${{ steps.signing.outputs.extra_apk }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

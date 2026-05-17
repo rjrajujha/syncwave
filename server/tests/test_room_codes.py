@@ -55,6 +55,18 @@ def test_invalid_wan_room_code_rejected() -> None:
     assert response.status_code == 409
 
 
+def test_pin_protected_requires_pin_on_rest_create() -> None:
+    app = create_app()
+    with TestClient(app) as client:
+        response = client.post(
+            '/rooms',
+            json={'roomName': 'WAN', 'roomId': 'WAN-PIN03', 'pinProtected': True},
+        )
+
+    assert response.status_code == 400
+    assert 'PIN is required' in response.json()['error']['message']
+
+
 def test_invalid_room_pin_rejected() -> None:
     app = create_app()
     with TestClient(app) as client:
@@ -63,7 +75,7 @@ def test_invalid_room_pin_rejected() -> None:
             json={'roomName': 'WAN', 'roomId': 'WAN-PIN01', 'pin': '12345'},
         )
 
-    assert response.status_code == 409
+    assert response.status_code == 400
     assert 'exactly 6 digits' in response.json()['error']['message']
 
 

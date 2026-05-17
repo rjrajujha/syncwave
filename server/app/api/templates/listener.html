@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#0b1020" />
+  <title>SyncWave Listener</title>
+  <!-- SyncWave 1.1.5 listener shell; assets: /stream/listener.css, /stream/listener.js -->
+  <link rel="stylesheet" href="/stream/listener.css?v={{APP_VERSION}}" />
+  <script defer src="/stream/listener.js{{LISTENER_JS_QUERY}}"></script>
+</head>
+<body>
+  <main class="scaffold">
+    <header class="top-bar">
+      <button type="button" class="pill-btn" id="detailsBtn">✦ Details</button>
+      <div class="header-title-main">SyncWave</div>
+      <div class="header-right">
+        <span id="headerListenerWrap" class="header-listener" hidden>
+          <strong id="headerListenerCount">0</strong> listening
+        </span>
+        <button class="info-btn" id="infoBtn" aria-label="About this listener">i</button>
+      </div>
+    </header>
+
+    <section class="player">
+      <div class="cover-hero">
+        {{COVER_ART_HTML}}
+        <div class="cover-fallback" aria-hidden="true">♪</div>
+      </div>
+      <div class="wave-wrap">
+        <canvas id="waveCanvas" width="600" height="144" aria-hidden="true"></canvas>
+      </div>
+
+      <div class="title-block">
+        <h1 class="title" id="roomTitle">Waiting for room…</h1>
+        <div class="subtitle" id="roomSubtitle">Open Details to enter a room code</div>
+      </div>
+
+      <div class="status-row">
+        <div class="status-pill disconnected" id="statusBadge">
+          <span class="dot"></span>
+          <span id="statusText">Disconnected</span>
+        </div>
+      </div>
+
+      <div class="controls">
+        <button id="toggleBtn" class="play-btn" aria-label="Play" disabled>▶</button>
+      </div>
+
+      <div class="error" id="errorText" role="alert"></div>
+    </section>
+
+    <p style="flex:0 0 auto;font-size:11px;color:var(--muted);text-align:center;margin:0;">
+      SyncWave {{APP_VERSION}} · {{SOURCE_LABEL}} · protocol {{PROTOCOL}}
+    </p>
+  </main>
+
+  <dialog id="detailsModal">
+    <h2>Details</h2>
+    <p>Join a room, then use Play to start Web Audio. Technical telemetry stays here so the player stays clean.</p>
+    <div class="room-form">
+      <div>
+        <label for="roomInput">Room code</label>
+        <input id="roomInput" type="text" placeholder="{{ROOM_DEFAULT_PREFIX}}XXXXX" value="{{INITIAL_ROOM}}" autocapitalize="characters" autocomplete="off" />
+      </div>
+      <div>
+        <label for="pinInput">Room PIN</label>
+        <input id="pinInput" type="password" inputmode="numeric" maxlength="6" placeholder="6 digits if required" value="{{INITIAL_PIN}}" autocomplete="off" />
+      </div>
+      <div class="row">
+        <button id="connectBtn" class="btn primary">Connect</button>
+        <button id="disconnectBtn" class="btn" disabled>Disconnect</button>
+      </div>
+    </div>
+    <div class="stats">
+      <div class="stat">
+        <div class="stat-label">Buffer</div>
+        <div class="stat-value" id="bufferValue">0 ms</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">RTT</div>
+        <div class="stat-value" id="latencyValue">—</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Offset</div>
+        <div class="stat-value" id="offsetValue">—</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Chunks in</div>
+        <div class="stat-value" id="chunkRx">0</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Dup drop</div>
+        <div class="stat-value" id="chunkDrop">0</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">WebAudio</div>
+        <div class="stat-value" id="audioCtxState">—</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Est. RMS</div>
+        <div class="stat-value" id="lastRms">—</div>
+      </div>
+    </div>
+    <div class="actions">
+      <button type="button" class="btn primary" id="closeDetails">Close</button>
+    </div>
+  </dialog>
+
+  <dialog id="infoModal">
+    <h2>About this listener</h2>
+    <p>You are listening to a SyncWave broadcast. The player schedules audio chunks against a server-stamped play time for tight inter-device sync.</p>
+    <ul>
+      <li><span>App version</span><strong>{{APP_VERSION}}</strong></li>
+      <li><span>Source</span><strong>{{SOURCE_LABEL}}</strong></li>
+      <li><span>Protocol</span><strong>{{PROTOCOL}}</strong></li>
+      <li><span>WebSocket path</span><strong>{{WS_PATH}}</strong></li>
+      <li><span>RTT</span><strong id="modalRtt">—</strong></li>
+      <li><span>Clock offset</span><strong id="modalOffset">—</strong></li>
+      <li><span>Source code</span><a href="https://github.com/OpenCodeQuark/syncwave" target="_blank" rel="noreferrer">github.com/OpenCodeQuark/syncwave</a></li>
+    </ul>
+    <div class="actions">
+      <button class="btn primary" id="closeInfo">Close</button>
+    </div>
+  </dialog>
+</body>
+</html>
